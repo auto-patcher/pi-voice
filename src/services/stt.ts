@@ -1,10 +1,12 @@
 import OpenAI, { toFile } from "openai";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
-import {
-  Whisper,
-  WhisperFullParams,
-  WhisperSamplingStrategy,
-} from "@napi-rs/whisper";
+// Type-only: `@napi-rs/whisper`'s native binding is loaded lazily (see
+// `getWhisperInstance`), not eagerly at module scope. Electron bundles its
+// own libstdc++/libgcc_s, and a real (value) import here `dlopen`s the addon
+// as soon as this module is loaded — unconditionally, for every provider,
+// since main.ts imports this module regardless of config — which crashes the
+// whole main process before it can even read the configured provider.
+import type { Whisper, WhisperFullParams, WhisperSamplingStrategy } from "@napi-rs/whisper";
 import type { SpeechProvider } from "./config.js";
 import { getGeminiClient } from "./gemini-client.js";
 import { resolveModelPath } from "./whisper-model.js";
@@ -39,6 +41,7 @@ async function getWhisperInstance(): Promise<Whisper> {
   if (whisperInitPromise) return whisperInitPromise;
 
   whisperInitPromise = (async () => {
+    const { Whisper } = await import("@napi-rs/whisper");
     const modelPath = await resolveModelPath();
     logger.info({ modelPath }, "Loading Whisper model");
     whisperInstance = new Whisper(modelPath);
@@ -136,6 +139,7 @@ async function transcribeElevenLabs(audioBuffer: Buffer): Promise<string> {
  */
 async function transcribeLocal(samples: Float32Array): Promise<string> {
   const whisper = await getWhisperInstance();
+  const { WhisperFullParams, WhisperSamplingStrategy } = await import("@napi-rs/whisper");
 
   const params = new WhisperFullParams(WhisperSamplingStrategy.Greedy);
   params.language = "auto";
