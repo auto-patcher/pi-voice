@@ -110,12 +110,26 @@ async function* synthesizeStreamOpenAI(
 ): AsyncGenerator<Buffer, void, undefined> {
   const client = getOpenAIClient();
 
-  const response = await client.audio.speech.create({
-    model: "gpt-4o-mini-tts",
-    voice: "alloy",
+  // Overridable so this provider also works against any OpenAI-compatible
+  // local server (e.g. speaches: https://speaches.ai) via OPENAI_BASE_URL —
+  // already respected by the SDK itself, since getOpenAIClient() never sets
+  // `baseURL` explicitly. Those servers key models/voices by their own IDs
+  // ("speaches-ai/Kokoro-82M-v1.0-ONNX" / "af_heart"), not OpenAI's.
+  // `sample_rate` isn't part of OpenAI's own API (hence the cast) but is
+  // speaches-specific, and worth pinning explicitly rather than trusting
+  // whatever the selected TTS model's native rate happens to be — pi-voice
+  // assumes every provider's "pcm" response is 24kHz.
+  const params: Parameters<typeof client.audio.speech.create>[0] & { sample_rate?: number } = {
+    model: process.env.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts",
+    voice: (process.env.OPENAI_TTS_VOICE ?? "alloy") as Parameters<typeof client.audio.speech.create>[0]["voice"],
     input: text,
     response_format: "pcm", // raw 24kHz 16-bit signed LE mono PCM
-  });
+  };
+  if (process.env.OPENAI_TTS_SAMPLE_RATE) {
+    params.sample_rate = Number(process.env.OPENAI_TTS_SAMPLE_RATE);
+  }
+
+  const response = await client.audio.speech.create(params);
 
   const arrayBuffer = await response.arrayBuffer();
   const fullBuffer = Buffer.from(arrayBuffer);

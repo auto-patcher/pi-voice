@@ -86,9 +86,16 @@ async function transcribeGemini(audioBuffer: Buffer): Promise<string> {
 async function transcribeOpenAI(audioBuffer: Buffer): Promise<string> {
   const client = getOpenAIClient();
 
+  // Overridable so this provider also works against any OpenAI-compatible
+  // local server (e.g. speaches: https://speaches.ai) via OPENAI_BASE_URL —
+  // already respected by the SDK itself, since getOpenAIClient() never sets
+  // `baseURL` explicitly. Those servers key models by HF repo id
+  // ("Systran/faster-distil-whisper-small.en"), not OpenAI's own model names.
+  const model = process.env.OPENAI_STT_MODEL ?? "gpt-4o-mini-transcribe";
+
   const file = await toFile(audioBuffer, "recording.webm");
   const transcription = await client.audio.transcriptions.create({
-    model: "gpt-4o-mini-transcribe",
+    model,
     file,
   });
 
