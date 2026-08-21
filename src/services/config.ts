@@ -197,15 +197,6 @@ export function formatKeyDisplay(binding: KeyBinding): string {
 const DEFAULT_KEY_STRING = "meta+shift+i";
 const DEFAULT_PROVIDER: SpeechProvider = "local";
 
-function defaultConfig(): PiVoiceConfig {
-  const binding = parseKeyBinding(DEFAULT_KEY_STRING);
-  return {
-    key: binding,
-    keyDisplay: formatKeyDisplay(binding),
-    provider: DEFAULT_PROVIDER,
-  };
-}
-
 // ── Zod schema for pi-voice.json ─────────────────────────────────────
 
 const configFileSchema = z.object({
@@ -245,32 +236,41 @@ export class ConfigError extends Error {
 
 /**
  * Load config from `<cwd>/.pi/pi-voice.json`.
- * Falls back to defaults if the file doesn't exist.
- * Throws `ConfigError` if the file exists but contains invalid values.
+ * Falls back to `PI_VOICE_PROVIDER` / `PI_VOICE_KEY` env vars if the file doesn't exist, then to
+ * hardcoded defaults if those aren't set either — lets a global default (e.g. set once via Nix)
+ * stand in for a `.pi/pi-voice.json` nobody's bothered to create in a given project, while a
+ * real project-level file still always wins.
+ * Throws `ConfigError` if the file exists but contains invalid values, or the env vars do.
  */
 export function loadConfig(cwd: string): PiVoiceConfig {
   const configPath = join(cwd, ".pi", "pi-voice.json");
 
-  let raw: string;
+  let raw: string | undefined;
   try {
     raw = readFileSync(configPath, "utf-8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      logger.info({ configPath }, "No config file found, using defaults");
-      return defaultConfig();
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new ConfigError(configPath, `Failed to read file: ${(err as Error).message}`);
     }
-    throw new ConfigError(configPath, `Failed to read file: ${(err as Error).message}`);
   }
 
-  // Parse JSON
   let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    throw new ConfigError(configPath, "Invalid JSON syntax");
+  if (raw === undefined) {
+    logger.info({ configPath }, "No config file found, checking PI_VOICE_* env vars");
+    json = {
+      ...(process.env.PI_VOICE_KEY !== undefined ? { key: process.env.PI_VOICE_KEY } : {}),
+      ...(process.env.PI_VOICE_PROVIDER !== undefined ? { provider: process.env.PI_VOICE_PROVIDER } : {}),
+    };
+  } else {
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      throw new ConfigError(configPath, "Invalid JSON syntax");
+    }
   }
 
-  // Validate with zod
+  // Validate with zod (same schema either way, so a bad PI_VOICE_PROVIDER value fails the same
+  // way a bad "provider" in the file would).
   const result = configFileSchema.safeParse(json);
   if (!result.success) {
     const details = result.error.issues
