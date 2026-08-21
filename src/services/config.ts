@@ -1,5 +1,5 @@
-import { join } from "node:path";
-import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { UiohookKey } from "uiohook-napi";
 import { z } from "zod";
 import logger from "./logger.js";
@@ -26,6 +26,15 @@ export interface PiVoiceConfig {
   keyDisplay: string;
   /** Speech provider for STT & TTS (default: "gemini") */
   provider: SpeechProvider;
+  /**
+   * Input/output device labels chosen by `pi-voice calibrate` (services/calibrate.ts).
+   * Labels, not deviceIds: Chromium's deviceIds aren't guaranteed stable across launches, and a
+   * label is what a human actually picked — renderer.ts re-resolves it to a live deviceId via
+   * enumerateDevices() at record/playback time. Unset means "whatever Chromium picks by default",
+   * which is the previous (and apparently unreliable) behavior.
+   */
+  inputDeviceLabel?: string;
+  outputDeviceLabel?: string;
 }
 
 // ── Key name → UiohookKey mapping ────────────────────────────────────
@@ -216,6 +225,8 @@ const configFileSchema = z.object({
     .optional()
     .default(DEFAULT_KEY_STRING),
   provider: z.enum(["local", "gemini", "openai", "elevenlabs"]).optional().default(DEFAULT_PROVIDER),
+  inputDeviceLabel: z.string().optional(),
+  outputDeviceLabel: z.string().optional(),
 });
 
 // ── Config loader ────────────────────────────────────────────────────
@@ -286,6 +297,54 @@ export function loadConfig(cwd: string): PiVoiceConfig {
   const binding = parseKeyBinding(parsed.key);
   const display = formatKeyDisplay(binding);
 
-  logger.info({ key: display, provider: parsed.provider, configPath }, "Loaded config");
-  return { key: binding, keyDisplay: display, provider: parsed.provider };
+  logger.info(
+    {
+      key: display,
+      provider: parsed.provider,
+      inputDeviceLabel: parsed.inputDeviceLabel,
+      outputDeviceLabel: parsed.outputDeviceLabel,
+      configPath,
+    },
+    "Loaded config",
+  );
+  return {
+    key: binding,
+    keyDisplay: display,
+    provider: parsed.provider,
+    inputDeviceLabel: parsed.inputDeviceLabel,
+    outputDeviceLabel: parsed.outputDeviceLabel,
+  };
+}
+
+/**
+ * Persist calibrated device labels to `<cwd>/.pi/pi-voice.json`, used by `pi-voice calibrate`
+ * (services/calibrate.ts). Merges into the existing file (preserving `key`/`provider` if a human
+ * set them) rather than overwriting it — creates the file/directory if neither exists yet.
+ * `label: undefined` for either field leaves that field untouched (calibrate only writes the
+ * side it actually ran, e.g. `--input-only`).
+ */
+export function saveDeviceCalibration(
+  cwd: string,
+  labels: { inputDeviceLabel?: string; outputDeviceLabel?: string },
+): void {
+  const configPath = join(cwd, ".pi", "pi-voice.json");
+
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = JSON.parse(readFileSync(configPath, "utf-8"));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new ConfigError(configPath, `Failed to read existing file: ${(err as Error).message}`);
+    }
+  }
+
+  const merged = {
+    ...existing,
+    ...(labels.inputDeviceLabel !== undefined ? { inputDeviceLabel: labels.inputDeviceLabel } : {}),
+    ...(labels.outputDeviceLabel !== undefined ? { outputDeviceLabel: labels.outputDeviceLabel } : {}),
+  };
+
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, `${JSON.stringify(merged, null, 2)}\n`);
+  logger.info({ configPath, ...labels }, "Saved device calibration");
 }

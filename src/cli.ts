@@ -16,15 +16,18 @@ import { sendCommand } from "./services/daemon-ipc.js";
 import { loadConfig, ConfigError } from "./services/config.js";
 import { resolveModelPath } from "./services/whisper-model.js";
 
-type Command = "start" | "status" | "stop";
+type Command = "start" | "status" | "stop" | "calibrate";
 
 function usage(): never {
   console.log(`Usage: pi-voice <command>
 
 Commands:
-  start   Start the pi-voice daemon in the background (default)
-  status  Show daemon status (state, PID, uptime)
-  stop    Stop the running daemon`);
+  start                 Start the pi-voice daemon in the background (default)
+  status                Show daemon status (state, PID, uptime)
+  stop                  Stop the running daemon
+  calibrate [--input|--output]
+                        Interactively pick the mic/speaker to use (stop the
+                        daemon first — they can't share audio devices)`);
   process.exit(0);
 }
 
@@ -33,6 +36,7 @@ function parseCommand(): Command {
   if (!arg || arg === "start") return "start";
   if (arg === "status") return "status";
   if (arg === "stop") return "stop";
+  if (arg === "calibrate") return "calibrate";
   if (arg === "--help" || arg === "-h") usage();
   console.error(`Unknown command: ${arg}`);
   usage();
@@ -156,27 +160,7 @@ async function cmdStart(): Promise<void> {
     }
   }
 
-  // Resolve package root by walking up from current file to find package.json.
-  // Works both from source (src/cli.ts) and built output (out/cli/cli.js).
-  const projectRoot = findPackageRoot(import.meta.dirname);
-  let electronBin: string;
-  try {
-    // The electron package's main export is a string path to the binary
-    const _require = createRequire(import.meta.url);
-    electronBin = _require("electron") as unknown as string;
-  } catch {
-    console.error("Could not find electron binary. Is 'electron' installed?");
-    process.exit(1);
-  }
-
-  // Resolve main entry (built output)
-  const mainEntry = join(projectRoot, "out", "main", "index.js");
-  if (!existsSync(mainEntry)) {
-    console.error(
-      "Electron main entry not found. Run 'bun run build' first."
-    );
-    process.exit(1);
-  }
+  const { electronBin, mainEntry } = resolveElectron();
 
   // Spawn Electron daemon as a detached background process
   const child = spawn(electronBin, [mainEntry], {
@@ -194,6 +178,69 @@ async function cmdStart(): Promise<void> {
   console.log(`  key: ${config.keyDisplay}, provider: ${config.provider}`);
 }
 
+/** Resolve the electron binary + built main entry, shared by `start` and `calibrate`. */
+function resolveElectron(): { electronBin: string; mainEntry: string } {
+  // Resolve package root by walking up from current file to find package.json.
+  // Works both from source (src/cli.ts) and built output (out/cli/cli.js).
+  const projectRoot = findPackageRoot(import.meta.dirname);
+  let electronBin: string;
+  try {
+    // The electron package's main export is a string path to the binary
+    const _require = createRequire(import.meta.url);
+    electronBin = _require("electron") as unknown as string;
+  } catch {
+    console.error("Could not find electron binary. Is 'electron' installed?");
+    process.exit(1);
+  }
+
+  const mainEntry = join(projectRoot, "out", "main", "index.js");
+  if (!existsSync(mainEntry)) {
+    console.error(
+      "Electron main entry not found. Run 'bun run build' first."
+    );
+    process.exit(1);
+  }
+
+  return { electronBin, mainEntry };
+}
+
+// ── calibrate ───────────────────────────────────────────────────────
+async function cmdCalibrate(): Promise<void> {
+  if (isDaemonRunning()) {
+    console.error(
+      "pi-voice daemon is running — stop it first (`pi-voice stop`); calibrate and the daemon can't share audio devices."
+    );
+    process.exit(1);
+  }
+
+  const arg = process.argv[3];
+  if (arg && arg !== "--input" && arg !== "--output") {
+    console.error(`Unknown option: ${arg}`);
+    console.error("Usage: pi-voice calibrate [--input|--output]");
+    process.exit(1);
+  }
+
+  const cwd = process.cwd();
+  const { electronBin, mainEntry } = resolveElectron();
+
+  // Attached, not detached: calibrate is an interactive foreground command (it prompts on the
+  // real terminal via readline in services/calibrate.ts), unlike the backgrounded `start` daemon.
+  const child = spawn(electronBin, [mainEntry], {
+    cwd,
+    env: {
+      ...process.env,
+      PI_VOICE_CWD: cwd,
+      PI_VOICE_CALIBRATE: arg === "--input" ? "input" : arg === "--output" ? "output" : "both",
+    },
+    stdio: "inherit",
+  });
+
+  const exitCode = await new Promise<number>((resolvePromise) => {
+    child.on("exit", (code) => resolvePromise(code ?? 1));
+  });
+  process.exit(exitCode);
+}
+
 // ── main ────────────────────────────────────────────────────────────
 const command = parseCommand();
 switch (command) {
@@ -205,5 +252,8 @@ switch (command) {
     break;
   case "stop":
     await cmdStop();
+    break;
+  case "calibrate":
+    await cmdCalibrate();
     break;
 }

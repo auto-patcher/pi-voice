@@ -23,6 +23,7 @@ import {
   type DaemonResponse,
 } from "./services/daemon-ipc.js";
 import { resolveModelPath } from "./services/whisper-model.js";
+import { runCalibration } from "./services/calibrate.js";
 import logger from "./services/logger.js";
 
 // ── Resolve working directory ───────────────────────────────────────
@@ -41,7 +42,13 @@ function setState(state: AppState, message?: string) {
   logger.info({ state, message }, "State changed");
 }
 
-function createWindow() {
+/**
+ * Resolves once the renderer has actually finished loading and run its script (registering the
+ * onStartRecording/onCalibrate* listeners preload.ts exposes) — sending an IPC message to the
+ * window any earlier is a silent no-op, since nothing's listening yet on the other end. Matters
+ * most for calibrate, which sends its first message immediately after createWindow() returns.
+ */
+function createWindow(): Promise<void> {
   mainWindow = new BrowserWindow({
     width: 400,
     height: 300,
@@ -57,6 +64,10 @@ function createWindow() {
     },
   });
 
+  const loaded = new Promise<void>((resolvePromise) => {
+    mainWindow!.webContents.once("did-finish-load", () => resolvePromise());
+  });
+
   if (!app.isPackaged && process.env["ELECTRON_RENDERER_URL"]) {
     mainWindow.loadURL(process.env["ELECTRON_RENDERER_URL"]);
   } else {
@@ -70,9 +81,11 @@ function createWindow() {
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
+
+  return loaded;
 }
 
-function setupIpcHandlers(provider: SpeechProvider) {
+function setupIpcHandlers(provider: SpeechProvider, outputDeviceLabel: string | undefined) {
   // Receive recording data from renderer
   ipcMain.on(IPC.RECORDING_DATA, async (_event, data: ArrayBuffer) => {
     if (currentState !== "recording") return;
@@ -133,6 +146,7 @@ function setupIpcHandlers(provider: SpeechProvider) {
                 sampleRate: TTS_SAMPLE_RATE,
                 channels: TTS_CHANNELS,
                 bitsPerSample: TTS_BITS_PER_SAMPLE,
+                outputDeviceLabel,
               });
             }
 
@@ -198,7 +212,7 @@ function setupFnHook(config: ReturnType<typeof loadConfig>) {
           return;
         }
         setState("recording", "Recording...");
-        mainWindow?.webContents.send(IPC.START_RECORDING, recordingFormat);
+        mainWindow?.webContents.send(IPC.START_RECORDING, recordingFormat, config.inputDeviceLabel);
       },
       onFnUp: () => {
         if (currentState !== "recording") return;
@@ -269,6 +283,28 @@ if (!gotLock) {
 
 // ── App lifecycle ───────────────────────────────────────────────────
 app.whenReady().then(async () => {
+  // `pi-voice calibrate` (cli.ts) spawns this exact same Electron entry, attached to a real
+  // terminal, with this env var set instead of going through the normal daemon startup below —
+  // it needs a live BrowserWindow for device enumeration/testing but none of the rest (no
+  // FnHook, no daemon socket, no runtime-state file: it's a one-shot foreground command, not a
+  // background daemon, and running both at once would fight over the same audio devices).
+  const calibrateMode = process.env["PI_VOICE_CALIBRATE"];
+  if (calibrateMode) {
+    await createWindow();
+    try {
+      await runCalibration(mainWindow!, workingCwd, {
+        inputOnly: calibrateMode === "input",
+        outputOnly: calibrateMode === "output",
+      });
+    } catch (err) {
+      logger.error({ err: err instanceof Error ? err.message : String(err) }, "Calibration failed");
+      process.exitCode = 1;
+    } finally {
+      app.quit();
+    }
+    return;
+  }
+
   let config: ReturnType<typeof loadConfig>;
   try {
     config = loadConfig(workingCwd);
@@ -294,8 +330,13 @@ app.whenReady().then(async () => {
     }
   }
 
+  // Not awaited (unlike the calibrate branch above): the daemon's first IPC send to the
+  // renderer only happens once the user presses the hotkey, which won't race a page load that
+  // usually finishes in well under a second. Awaiting it here just delays saveRuntimeState below
+  // for no benefit, which made `pi-voice status`/`stop` spuriously report "not running" for a
+  // moment right after `start`.
   createWindow();
-  setupIpcHandlers(config.provider);
+  setupIpcHandlers(config.provider, config.outputDeviceLabel);
   setupFnHook(config);
 
   // Start daemon IPC server
