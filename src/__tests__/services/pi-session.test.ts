@@ -1,6 +1,4 @@
 import { describe, test, expect, beforeEach, mock } from "bun:test";
-import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
 
 // Mock logger
 mock.module("../../services/logger.js", () => ({
@@ -12,49 +10,53 @@ mock.module("../../services/logger.js", () => ({
   },
 }));
 
-/**
- * Fakes a `pi -p --mode json ...` child process: a real EventEmitter (spawn()'s return value)
- * with real stdout/stderr streams, so pi-session.ts's actual `readline.createInterface` /
- * `.on("data", ...)` wiring runs unmodified against it.
- */
-function mockChild(opts: { lines?: string[]; exitCode?: number; stderr?: string } = {}) {
-  const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough };
-  child.stdout = new PassThrough();
-  child.stderr = new PassThrough();
+// Mock the pi coding agent SDK
+const mockDispose = mock(() => {});
+const mockPrompt = mock(async (_text: string) => {});
+const mockSubscribe = mock((_cb: any) => {
+  return () => {}; // unsubscribe
+});
 
-  queueMicrotask(() => {
-    for (const line of opts.lines ?? []) {
-      child.stdout.write(`${line}\n`);
-    }
-    child.stdout.end();
-    if (opts.stderr) child.stderr.write(opts.stderr);
-    child.stderr.end();
-    child.emit("exit", opts.exitCode ?? 0);
-  });
+const mockSession = {
+  dispose: mockDispose,
+  prompt: mockPrompt,
+  subscribe: mockSubscribe,
+};
 
-  return child;
-}
-
-const mockSpawn = mock((_cmd: string, _args: string[], _opts: unknown) => mockChild());
-
-mock.module("node:child_process", () => ({
-  spawn: mockSpawn,
+const mockCreateAgentSession = mock(async (_opts: any) => ({
+  session: mockSession,
+  extensionsResult: { extensions: [], errors: [] },
 }));
 
-const { setSessionCwd, prompt, dispose } = await import("../../services/pi-session.js");
+const mockSessionManagerInMemory = mock(() => ({}));
 
-function textEndLine(content: string): string {
-  return JSON.stringify({
-    type: "message_update",
-    assistantMessageEvent: { type: "text_end", content },
-  });
-}
+mock.module("@earendil-works/pi-coding-agent", () => ({
+  createAgentSession: mockCreateAgentSession,
+  SessionManager: {
+    inMemory: mockSessionManagerInMemory,
+  },
+}));
+
+const {
+  setSessionCwd,
+  getOrCreateSession,
+  prompt,
+  dispose,
+} = await import("../../services/pi-session.js");
 
 describe("pi-session", () => {
   beforeEach(() => {
-    dispose();
-    mockSpawn.mockClear();
-    mockSpawn.mockImplementation(() => mockChild());
+    dispose(); // reset cached session
+    mockCreateAgentSession.mockClear();
+    mockCreateAgentSession.mockImplementation(async (_opts: any) => ({
+      session: mockSession,
+      extensionsResult: { extensions: [], errors: [] },
+    }));
+    mockDispose.mockClear();
+    mockPrompt.mockClear();
+    mockPrompt.mockImplementation(async () => {});
+    mockSubscribe.mockClear();
+    mockSubscribe.mockImplementation((_cb: any) => () => {});
   });
 
   describe("setSessionCwd", () => {
@@ -63,119 +65,183 @@ describe("pi-session", () => {
     });
   });
 
-  describe("prompt", () => {
-    test("spawns pi with the prompt text and cwd", async () => {
+  describe("getOrCreateSession", () => {
+    test("creates a session on first call", async () => {
+      const session = await getOrCreateSession();
+      expect(session).toBeDefined();
+      expect(mockCreateAgentSession).toHaveBeenCalledTimes(1);
+    });
+
+    test("returns cached session on subsequent calls", async () => {
+      const s1 = await getOrCreateSession();
+      const s2 = await getOrCreateSession();
+      expect(s1).toBe(s2);
+      expect(mockCreateAgentSession).toHaveBeenCalledTimes(1);
+    });
+
+    test("passes cwd to createAgentSession", async () => {
       setSessionCwd("/my/project");
+      await getOrCreateSession();
+      const calls = mockCreateAgentSession.mock.calls as any[];
+      expect(calls[0]![0].cwd).toBe("/my/project");
+    });
+
+    test("uses in-memory session manager", async () => {
+      await getOrCreateSession();
+      expect(mockSessionManagerInMemory).toHaveBeenCalled();
+    });
+
+    test("logs a warning but does not throw when extensions fail to load", async () => {
+      mockCreateAgentSession.mockImplementation(async () => ({
+        session: mockSession,
+        extensionsResult: {
+          extensions: [],
+          errors: [{ path: "/some/ext.ts", error: "boom" }],
+        },
+      }));
+      await expect(getOrCreateSession()).resolves.toBeDefined();
+    });
+  });
+
+  describe("prompt", () => {
+    test("calls session.prompt with the text", async () => {
       await prompt("hello world");
-
-      const call = mockSpawn.mock.calls[0] as unknown as [string, string[], { cwd: string }];
-      expect(call[0]).toBe("pi");
-      expect(call[1]).toContain("hello world");
-      expect(call[2].cwd).toBe("/my/project");
+      const calls = mockPrompt.mock.calls as any[];
+      expect(calls[0]![0]).toBe("hello world");
     });
 
-    test("reuses the same --session-id across calls", async () => {
-      await prompt("first");
-      await prompt("second");
+    test("subscribes before prompting and unsubscribes after", async () => {
+      const unsubscribeFn = mock(() => {});
+      mockSubscribe.mockImplementation(() => unsubscribeFn);
 
-      const args1 = (mockSpawn.mock.calls[0] as unknown as [string, string[]])[1];
-      const args2 = (mockSpawn.mock.calls[1] as unknown as [string, string[]])[1];
-      const sessionIdIndex = args1.indexOf("--session-id") + 1;
-      expect(args1[sessionIdIndex]).toBe(args2[sessionIdIndex]);
+      await prompt("test");
+
+      expect(mockSubscribe).toHaveBeenCalledTimes(1);
+      expect(unsubscribeFn).toHaveBeenCalledTimes(1);
     });
 
-    test("dispose() causes the next prompt to use a new --session-id", async () => {
-      await prompt("first");
-      dispose();
-      await prompt("second");
+    test("unsubscribes even if prompt throws", async () => {
+      const unsubscribeFn = mock(() => {});
+      mockSubscribe.mockImplementation(() => unsubscribeFn);
+      mockPrompt.mockImplementation(async () => {
+        throw new Error("prompt failed");
+      });
 
-      const args1 = (mockSpawn.mock.calls[0] as unknown as [string, string[]])[1];
-      const args2 = (mockSpawn.mock.calls[1] as unknown as [string, string[]])[1];
-      const i = args1.indexOf("--session-id") + 1;
-      expect(args1[i]).not.toBe(args2[i]);
+      await expect(prompt("fail")).rejects.toThrow("prompt failed");
+      expect(unsubscribeFn).toHaveBeenCalledTimes(1);
     });
 
-    test("calls onTextEnd for each text_end event", async () => {
-      mockSpawn.mockImplementation(() => mockChild({ lines: [textEndLine("Hello from pi")] }));
+    test("calls onTextEnd callback for text_end events", async () => {
       const onTextEnd = mock((_s: string) => {});
+
+      mockSubscribe.mockImplementation((cb: any) => {
+        cb({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_end",
+            content: "Hello from pi",
+          },
+        });
+        return () => {};
+      });
 
       await prompt("test", { onTextEnd });
       expect(onTextEnd).toHaveBeenCalledWith("Hello from pi");
     });
 
-    test("calls onTextEnd once per text_end event, in order", async () => {
-      mockSpawn.mockImplementation(() =>
-        mockChild({ lines: [textEndLine("first sentence."), textEndLine("second sentence.")] }),
-      );
-      const segments: string[] = [];
-
-      await prompt("test", { onTextEnd: (s) => void segments.push(s) });
-      expect(segments).toEqual(["first sentence.", "second sentence."]);
-    });
-
     test("skips empty content in text_end events", async () => {
-      mockSpawn.mockImplementation(() => mockChild({ lines: [textEndLine("   ")] }));
       const onTextEnd = mock((_s: string) => {});
+
+      mockSubscribe.mockImplementation((cb: any) => {
+        cb({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_end",
+            content: "   ",
+          },
+        });
+        return () => {};
+      });
 
       await prompt("test", { onTextEnd });
       expect(onTextEnd).not.toHaveBeenCalled();
     });
 
-    test("ignores non-JSON and unrelated event lines", async () => {
-      mockSpawn.mockImplementation(() =>
-        mockChild({
-          lines: [
-            "not json at all",
-            JSON.stringify({ type: "agent_start" }),
-            JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_start" } }),
-          ],
-        }),
-      );
+    test("ignores non-text_end events", async () => {
       const onTextEnd = mock((_s: string) => {});
 
-      await expect(prompt("test", { onTextEnd })).resolves.toBeUndefined();
+      mockSubscribe.mockImplementation((cb: any) => {
+        cb({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_start",
+            content: "start",
+          },
+        });
+        return () => {};
+      });
+
+      await prompt("test", { onTextEnd });
       expect(onTextEnd).not.toHaveBeenCalled();
     });
 
-    test("rejects when a turn_end event carries an errorMessage", async () => {
-      mockSpawn.mockImplementation(() =>
-        mockChild({
-          lines: [
-            JSON.stringify({ type: "turn_end", message: { errorMessage: "out of extra usage" } }),
-          ],
-        }),
-      );
-
-      await expect(prompt("test")).rejects.toThrow("out of extra usage");
-    });
-
-    test("rejects with stderr when pi exits non-zero and emitted no error event", async () => {
-      mockSpawn.mockImplementation(() => mockChild({ exitCode: 1, stderr: "pi: command not found\n" }));
-
-      await expect(prompt("test")).rejects.toThrow("pi: command not found");
-    });
-
-    test("rejects when spawn itself errors (pi not on PATH)", async () => {
-      mockSpawn.mockImplementation(() => {
-        // No scheduled "exit" here (unlike mockChild()) — only "error" should fire.
-        const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough };
-        child.stdout = new PassThrough();
-        child.stderr = new PassThrough();
-        queueMicrotask(() => {
-          child.stdout.end();
-          child.stderr.end();
-          child.emit("error", new Error("spawn pi ENOENT"));
+    // The whole reason prompt() tracks turn_end separately: a turn that errors out (auth,
+    // quota, network) produces zero text_end events, which previously looked identical to
+    // "the model just said nothing" -- see pi-session.ts header comment.
+    describe("turn_end error surfacing", () => {
+      test("rejects when a turn_end event carries an errorMessage", async () => {
+        mockSubscribe.mockImplementation((cb: any) => {
+          cb({ type: "turn_end", message: { errorMessage: "out of extra usage" } });
+          return () => {};
         });
-        return child;
+
+        await expect(prompt("test")).rejects.toThrow("out of extra usage");
       });
 
-      await expect(prompt("test")).rejects.toThrow("ENOENT");
+      test("does not reject when turn_end has no errorMessage", async () => {
+        mockSubscribe.mockImplementation((cb: any) => {
+          cb({ type: "turn_end", message: {} });
+          return () => {};
+        });
+
+        await expect(prompt("test")).resolves.toBeUndefined();
+      });
+
+      test("still delivers any text_end segments that arrived before the error", async () => {
+        const onTextEnd = mock((_s: string) => {});
+        mockSubscribe.mockImplementation((cb: any) => {
+          cb({
+            type: "message_update",
+            assistantMessageEvent: { type: "text_end", content: "partial answer" },
+          });
+          cb({ type: "turn_end", message: { errorMessage: "network error" } });
+          return () => {};
+        });
+
+        await expect(prompt("test", { onTextEnd })).rejects.toThrow("network error");
+        expect(onTextEnd).toHaveBeenCalledWith("partial answer");
+      });
     });
   });
 
   describe("dispose", () => {
+    test("disposes the session", async () => {
+      await getOrCreateSession();
+      dispose();
+      expect(mockDispose).toHaveBeenCalledTimes(1);
+    });
+
     test("does nothing when no session exists", () => {
       expect(() => dispose()).not.toThrow();
+    });
+
+    test("allows creating new session after dispose", async () => {
+      await getOrCreateSession();
+      dispose();
+      mockCreateAgentSession.mockClear();
+
+      await getOrCreateSession();
+      expect(mockCreateAgentSession).toHaveBeenCalledTimes(1);
     });
   });
 });

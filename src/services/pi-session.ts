@@ -1,38 +1,71 @@
 /**
- * Talks to the real `pi` CLI as a child process, not the bundled `@mariozechner/pi-coding-agent`
- * SDK this package still depends on for its types.
+ * Talks to the real pi coding agent via `@earendil-works/pi-coding-agent` (SDK embedding, not
+ * shelling out to the `pi` CLI). Two things have to be true for this to work correctly rather
+ * than silently misbehave, both nailed down by direct testing:
  *
- * Why: that SDK bundles its own, much older model catalog (as of this package's pinned
- * ^0.52.7, it doesn't even know the "claude-sonnet-5" model ID a current `pi` install's
- * settings.json configures) and its own auth/extension system, which has no way to load
- * `pi-black` or anything else a real `pi` setup relies on. `createAgentSession()`'s own
- * documented behavior for an unrecognized configured model is "default: from settings, else
- * first available" -- silently falling back to whatever model that resolves to, in practice an
- * expensive one with its own separate, easily-exhausted usage allowance, producing a 400 that
- * looks identical to "the model said nothing" from pi-voice's perspective (no assistant text,
- * no thrown error). None of this reproduces with the real `pi` CLI, which uses eva's actual
- * settings.json, model catalog, and pi-black routing.
+ * 1. It must be pinned to *exactly* the version pi-black expects (currently 0.84.1 -- see
+ *    SUPPORTED_PI_VERSION in paoloanzn/pi-black's src/claude-code-protocol.ts). package.json
+ *    pins `@earendil-works/pi-coding-agent` and every `@earendil-works/*` sibling it transitively
+ *    depends on to the exact same version (no `^` ranges) for this reason -- a caret range lets
+ *    bun float individual siblings to a newer patch even when the top-level package is pinned.
  *
- * `pi -p --mode json` turns out to emit the exact same event schema the SDK's own
- * `session.subscribe()` does (message_update/text_start/text_delta/text_end, turn_end,
- * agent_end, ...) -- shared lineage, not a coincidence -- so this is a drop-in swap: same
- * `onTextEnd` callback contract, but with byte-for-byte parity to a manual `pi -p` invocation
- * instead of a second, drifting implementation of "what pi does."
+ * 2. `~/.pi/agent` (or wherever `agentDir` points) needs a `node_modules/@earendil-works/
+ *    pi-coding-agent` reachable via a plain directory walk-up from wherever its git-installed
+ *    extensions live (e.g. `~/.pi/agent/git/github.com/paoloanzn/pi-black/extensions/`).
+ *    createAgentSession()'s extension loader (jiti, with an alias map pointing bare
+ *    `@earendil-works/pi-coding-agent` imports at this package's own dist/index.js) doesn't
+ *    reliably win over plain Node/Bun module resolution for imports *inside* a loaded
+ *    extension -- when the extension's own directory has no reachable node_modules at all
+ *    (true for anything under `~/.pi/agent/git/...`, which has none in its ancestry), resolution
+ *    falls through to some other, uncontrolled instance (e.g. Bun's global install cache) instead
+ *    of the alias target, and pi-black's own version check then sees a version pi-voice never
+ *    installed and never agreed to. This isn't pi-voice's job to fix directly -- (2) has to be
+ *    provisioned externally (see dotfiles' module/pi-coding-agent-sdk.nix, which drops a matching
+ *    node_modules there declaratively) -- but it's why pi-voice pins so precisely per (1): the
+ *    provisioned copy and this package's own version must match exactly, or the two problems
+ *    compound instead of cancel out.
+ *
+ * Once both are true, this doesn't just work as well as shelling out to `pi -p` -- it's strictly
+ * better: no per-turn subprocess spawn, and no equivalent of the `pi -p`-mode bug where a
+ * tool-using turn exits without ever producing the model's follow-up text (confirmed: multi-turn
+ * tool use completes correctly in a single session.prompt() call here).
  */
-import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { createInterface } from "node:readline";
+import {
+  createAgentSession,
+  SessionManager,
+  type AgentSession,
+} from "@earendil-works/pi-coding-agent";
 import logger from "./logger.js";
 
+let session: AgentSession | null = null;
 let sessionCwd: string = process.cwd();
-let sessionId: string | null = null;
 
 /**
- * Set the working directory used when invoking `pi`.
- * Must be called before the first prompt() call.
+ * Set the working directory used when creating the agent session.
+ * Must be called before the first getOrCreateSession() call.
  */
 export function setSessionCwd(cwd: string): void {
   sessionCwd = cwd;
+}
+
+/**
+ * Initialize (or reuse) a pi coding agent session.
+ * Uses default discovery for skills, extensions, tools, context files.
+ */
+export async function getOrCreateSession(): Promise<AgentSession> {
+  if (session) return session;
+
+  logger.info({ cwd: sessionCwd }, "Creating new agent session");
+  const result = await createAgentSession({
+    cwd: sessionCwd,
+    sessionManager: SessionManager.inMemory(),
+  });
+  if (result.extensionsResult.errors.length > 0) {
+    logger.warn({ errors: result.extensionsResult.errors }, "Extension load errors");
+  }
+  session = result.session;
+  logger.info("Agent session created");
+  return session;
 }
 
 export interface PromptOptions {
@@ -40,92 +73,53 @@ export interface PromptOptions {
   onTextEnd?: (segment: string) => void | Promise<void>;
 }
 
-interface TextEndEvent {
-  type: "message_update";
-  assistantMessageEvent: { type: "text_end"; content: string };
-}
-
-interface TurnEndEvent {
-  type: "turn_end";
-  message: { errorMessage?: string };
-}
-
-function isTextEnd(event: unknown): event is TextEndEvent {
-  return (
-    typeof event === "object" &&
-    event !== null &&
-    (event as { type?: unknown }).type === "message_update" &&
-    (event as { assistantMessageEvent?: { type?: unknown } }).assistantMessageEvent?.type === "text_end"
-  );
-}
-
-function isTurnEnd(event: unknown): event is TurnEndEvent {
-  return typeof event === "object" && event !== null && (event as { type?: unknown }).type === "turn_end";
-}
-
 /**
- * Send a prompt to `pi`, continuing the same `--session-id` across calls within this process's
- * lifetime so multi-turn context carries over exactly like a persistent AgentSession would.
- * `onTextEnd` is called for each completed text segment so callers can start TTS incrementally
- * without waiting for the full response.
+ * Send a prompt to pi.
+ * `onTextEnd` is called for each completed text segment so callers can
+ * start TTS incrementally without waiting for the full response.
+ * Throws if the turn ends with an error (e.g. auth/quota failures) -- a turn that errors
+ * produces no text_end events, which would otherwise look identical to "the model said nothing".
  */
-export async function prompt(text: string, options?: PromptOptions): Promise<void> {
-  if (!sessionId) sessionId = randomUUID();
+export async function prompt(
+  text: string,
+  options?: PromptOptions,
+): Promise<void> {
+  const s = await getOrCreateSession();
 
-  logger.info({ cwd: sessionCwd, sessionId }, "Prompting pi");
-
-  const child = spawn("pi", ["-p", "--mode", "json", "--session-id", sessionId, text], {
-    cwd: sessionCwd,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  const rl = createInterface({ input: child.stdout });
   let turnError: string | undefined;
-  let stderr = "";
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-
-  rl.on("line", (line) => {
-    if (!line.trim()) return;
-    let event: unknown;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      return; // pi shouldn't emit non-JSON lines in --mode json, but don't choke if it does
-    }
-
-    if (isTextEnd(event)) {
+  const unsubscribe = s.subscribe((event) => {
+    if (
+      event.type === "message_update" &&
+      event.assistantMessageEvent.type === "text_end"
+    ) {
       const content = event.assistantMessageEvent.content.trim();
       if (content.length > 0) {
         logger.info({ content }, "Agent response");
         options?.onTextEnd?.(content);
       }
-    } else if (isTurnEnd(event) && event.message.errorMessage) {
+    } else if (event.type === "turn_end" && event.message.errorMessage) {
       turnError = event.message.errorMessage;
     }
   });
 
-  const exitCode = await new Promise<number>((resolvePromise, reject) => {
-    child.on("error", reject); // e.g. `pi` not on PATH
-    child.on("exit", (code) => resolvePromise(code ?? 1));
-  });
-
-  if (exitCode !== 0) {
-    throw new Error(turnError ?? stderr.trim() ?? `pi exited with code ${exitCode}`);
+  try {
+    await s.prompt(text);
+  } finally {
+    unsubscribe();
   }
+
   if (turnError) {
     throw new Error(turnError);
   }
 }
 
 /**
- * Drop the session ID, so the next prompt() starts a fresh `pi` conversation instead of
- * continuing the old one.
+ * Dispose the current session.
  */
 export function dispose(): void {
-  if (sessionId) {
-    logger.info({ sessionId }, "Agent session disposed");
-    sessionId = null;
+  if (session) {
+    session.dispose();
+    session = null;
+    logger.info("Agent session disposed");
   }
 }

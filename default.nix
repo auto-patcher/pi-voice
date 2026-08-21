@@ -31,6 +31,16 @@
 }:
 let
   package = builtins.fromJSON (builtins.readFile ./package.json);
+  bunPackages = import ./bun.nix { inherit (pkgs) copyPathToStore fetchFromGitHub fetchgit fetchurl; };
+
+  # bun.nix keys packages by exact resolved version ("uiohook-napi@1.5.5"), which drifts on
+  # every `bun install` against the caret ranges in package.json -- find whichever version is
+  # actually there right now instead of hardcoding one that'll go stale.
+  findVersionedKey =
+    pname:
+    lib.findFirst (name: lib.hasPrefix "${pname}@" name) (throw "${pname}@* not found in bun.nix") (
+        builtins.attrNames bunPackages
+      );
 
   # Only these two packages ship prebuilt native `.node` addons that need
   # relinking against nixpkgs' glibc/X11; a blanket `autoPatchElf` over every
@@ -52,7 +62,7 @@ let
     bunNix = ./bun.nix;
     overrides = {
       # Global hotkey capture (X11 XTest) for push-to-talk.
-      "uiohook-napi@1.5.4" = patchNativeAddon [
+      "${findVersionedKey "uiohook-napi"}" = patchNativeAddon [
         libx11
         libxtst
         libxi
@@ -61,7 +71,7 @@ let
         libxt
       ];
       # Local Whisper STT.
-      "@napi-rs/whisper-linux-x64-gnu@0.0.4" = patchNativeAddon [ ];
+      "${findVersionedKey "@napi-rs/whisper-linux-x64-gnu"}" = patchNativeAddon [ ];
     };
   };
 in
