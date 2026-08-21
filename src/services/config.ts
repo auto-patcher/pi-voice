@@ -246,12 +246,19 @@ export class ConfigError extends Error {
 }
 
 /**
- * Load config from `<cwd>/.pi/pi-voice.json`.
- * Falls back to `PI_VOICE_PROVIDER` / `PI_VOICE_KEY` env vars if the file doesn't exist, then to
- * hardcoded defaults if those aren't set either — lets a global default (e.g. set once via Nix)
- * stand in for a `.pi/pi-voice.json` nobody's bothered to create in a given project, while a
- * real project-level file still always wins.
- * Throws `ConfigError` if the file exists but contains invalid values, or the env vars do.
+ * Load config from `<cwd>/.pi/pi-voice.json`, merged *per field* with `PI_VOICE_PROVIDER` /
+ * `PI_VOICE_KEY` env vars, in that priority order (file wins, then env, then hardcoded
+ * defaults) — lets a global default (e.g. set once via Nix) stand in for whichever fields a
+ * given project's `.pi/pi-voice.json` doesn't set, without requiring the file to set *all* of
+ * them or not exist at all.
+ *
+ * This has to be a field-level merge, not "use the file if it exists, else use env vars": a file
+ * that exists but only sets some fields (e.g. `pi-voice calibrate` writing just
+ * `inputDeviceLabel`) previously fell entirely into the "file exists" branch, silently losing
+ * the env fallback for `provider`/`key` and reverting to the hardcoded zod default instead.
+ *
+ * Throws `ConfigError` if the file contains invalid JSON, or the merged result (file + env)
+ * fails validation.
  */
 export function loadConfig(cwd: string): PiVoiceConfig {
   const configPath = join(cwd, ".pi", "pi-voice.json");
@@ -265,20 +272,22 @@ export function loadConfig(cwd: string): PiVoiceConfig {
     }
   }
 
-  let json: unknown;
+  let fileJson: Record<string, unknown> = {};
   if (raw === undefined) {
-    logger.info({ configPath }, "No config file found, checking PI_VOICE_* env vars");
-    json = {
-      ...(process.env.PI_VOICE_KEY !== undefined ? { key: process.env.PI_VOICE_KEY } : {}),
-      ...(process.env.PI_VOICE_PROVIDER !== undefined ? { provider: process.env.PI_VOICE_PROVIDER } : {}),
-    };
+    logger.info({ configPath }, "No config file found");
   } else {
     try {
-      json = JSON.parse(raw);
+      fileJson = JSON.parse(raw);
     } catch {
       throw new ConfigError(configPath, "Invalid JSON syntax");
     }
   }
+
+  const json = {
+    ...(process.env.PI_VOICE_KEY !== undefined ? { key: process.env.PI_VOICE_KEY } : {}),
+    ...(process.env.PI_VOICE_PROVIDER !== undefined ? { provider: process.env.PI_VOICE_PROVIDER } : {}),
+    ...fileJson,
+  };
 
   // Validate with zod (same schema either way, so a bad PI_VOICE_PROVIDER value fails the same
   // way a bad "provider" in the file would).
